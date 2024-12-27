@@ -1,5 +1,6 @@
 from os import getenv
 from textwrap import dedent
+import asyncio
 
 import httpx
 import mcp.server.stdio
@@ -9,10 +10,9 @@ from mcp.server.models import InitializationOptions
 
 PERPLEXITY_API_KEY = getenv("PERPLEXITY_API_KEY")
 PERPLEXITY_API_BASE_URL = "https://api.perplexity.ai"
-
+DEFAULT_TIMEOUT = 60.0  # Default timeout in seconds
 
 server = Server("mcp-server-perplexity")
-
 
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
@@ -82,7 +82,6 @@ async def handle_list_tools() -> list[types.Tool]:
         )
     ]
 
-
 @server.call_tool()
 async def handle_call_tool(
     name: str, arguments: dict
@@ -91,27 +90,65 @@ async def handle_call_tool(
         raise ValueError(f"Unknown tool: {name}")
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{PERPLEXITY_API_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=arguments,
-                timeout=None,
+        # Get the request context for cancellation support
+        context = server.request_context
+        transport = httpx.AsyncHTTPTransport(retries=2)
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            # Create a task that can be cancelled
+            request_task = asyncio.create_task(
+                client.post(
+                    f"{PERPLEXITY_API_BASE_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=arguments,
+                    timeout=DEFAULT_TIMEOUT,
+                )
             )
-            response.raise_for_status()
+
+            try:
+                # Wait for either the request to complete or cancellation
+                response = await asyncio.shield(request_task)
+                response.raise_for_status()
+                
+                return [
+                    types.TextContent(
+                        type="text",
+                        text=response.text,
+                    )
+                ]
+
+            except asyncio.CancelledError:
+                # Handle cancellation
+                request_task.cancel()
+                try:
+                    await request_task
+                except asyncio.CancelledError:
+                    pass
+                
+                return [
+                    types.TextContent(
+                        type="text",
+                        text="Request was cancelled by the client."
+                    )
+                ]
+
+    except httpx.TimeoutException as e:
+        return [
+            types.TextContent(
+                type="text",
+                text=f"Request timed out after {DEFAULT_TIMEOUT} seconds. Please try again.",
+            )
+        ]
     except httpx.HTTPError as e:
-        raise RuntimeError(f"API error: {str(e)}")
-
-    return [
-        types.TextContent(
-            type="text",
-            text=response.text,
-        )
-    ]
-
+        error_message = f"API error: {str(e)}"
+        if hasattr(e.response, 'text'):
+            error_message += f"\\nResponse: {e.response.text}"
+        raise RuntimeError(error_message)
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error: {str(e)}")
 
 async def main():
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
@@ -120,7 +157,7 @@ async def main():
             write_stream,
             InitializationOptions(
                 server_name="mcp-server-perplexity",
-                server_version="0.1.2",
+                server_version="0.1.3",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(tools_changed=True),
                     experimental_capabilities={},
